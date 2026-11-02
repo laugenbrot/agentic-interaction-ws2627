@@ -3,3 +3,4 @@ exercises/
 .env
 logs/
 __pycache__/
+.vscode/

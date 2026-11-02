@@ -112,6 +112,7 @@ def main() -> int:
     # --- First model call: the model decides to call the tool. ---
     started = time.monotonic()
     try:
+        # model call returns a response object with a list of choices, each containing a message (default is one choice)
         first = client.chat.completions.create(
             model=MODEL,
             messages=messages,
