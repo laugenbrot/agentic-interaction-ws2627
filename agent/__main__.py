@@ -135,6 +135,7 @@ def main() -> int:
     messages.append(message)
     for tool_call in message.tool_calls:
         args = json.loads(tool_call.function.arguments or "{}")
+        log.add("tool_call", True, tool=tool_call.function.name, args=args)
         result = get_calendar(args.get("date", ""))
         log.add("tool_result", True, tool=tool_call.function.name, args=args)
         messages.append({
