@@ -20,6 +20,9 @@ MODEL = os.environ["MODEL"]
 API_KEY = os.environ["OPENAI_API_KEY"]
 DATA_BASE_URL = os.environ["DATA_BASE_URL"]
 
+# Hard stop so no run can go on forever.
+MAX_STEPS = 10
+
 
 def get_calendar(date: str) -> str:
     """Fetch {DATA_BASE_URL}/calendar/{date}.json. 404 means: no data."""
@@ -65,8 +68,11 @@ class RunLog:
 
     def __init__(self) -> None:
         LOG_DIR.mkdir(exist_ok=True) # create logs/ if its missing
-        self.run_id = uuid.uuid4().hex 
-        self.path = LOG_DIR / f"{self.run_id}.jsonl"
+        self.run_id = uuid.uuid4().hex
+        # timestamp of the session start, local time, e.g. 2026-11-17T07-37-08
+        # (":" is not allowed in filenames on all systems, so it becomes "-")
+        started_at = datetime.now().isoformat(timespec="seconds")
+        self.path = LOG_DIR / f"{started_at.replace(':', '-')}_{self.run_id}.jsonl"
 
     # example: add("tool_call", ok=True, tool="get_calendar", date="2023-01-01")
     def add(self, event: str, ok: bool, **fields) -> None:
@@ -109,59 +115,70 @@ def main() -> int:
         {"role": "user", "content": user_task},
     ]
 
-    # --- First model call: the model decides to call the tool. ---
-    started = time.monotonic()
-    try:
-        # model call returns a response object with a list of choices, each containing a message (default is one choice)
-        first = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=[TOOL_SCHEMA],
-        )
-    except Exception as error:
-        log.add("error", False, message=str(error),
-                duration_ms=int((time.monotonic() - started) * 1000))
-        print(f"Model request failed: {error}", file=sys.stderr)
-        return 1
+    # --- The agent loop. Every iteration of this loop is one step, ---
+    # --- and every step is one model call. The loop ends when the ---
+    # --- model answers without asking for a tool, or at the step limit. ---
+    for step in range(1, MAX_STEPS + 1):
+        started = time.monotonic()
+        try:
+            # model call returns a response object with a list of choices, each containing a message (default is one choice)
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=[TOOL_SCHEMA],
+            )
+        except Exception as error:
+            log.add("error", False, message=str(error),
+                    duration_ms=int((time.monotonic() - started) * 1000))
+            print(f"Model request failed: {error}", file=sys.stderr)
+            return 1
 
-    message = first.choices[0].message
-    if not message.tool_calls:
-        # Model answered directly without the tool.
-        log.add("final", True, duration_ms=int((time.monotonic() - started) * 1000))
-        print(message.content)
-        return 0
+        message = response.choices[0].message
 
-    # --- Run the tool(s) the model asked for. ---
-    messages.append(message)
-    for tool_call in message.tool_calls:
-        args = json.loads(tool_call.function.arguments or "{}")
-        log.add("tool_call", True, tool=tool_call.function.name, args=args)
-        result = get_calendar(args.get("date", ""))
-        log.add("tool_result", True, tool=tool_call.function.name, args=args)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": result,
-        })
+        if not message.tool_calls:
+            # Model answered directly: the agent decided it is done.
+            log.add("final", True, step=step, kind="answer",
+                    duration_ms=int((time.monotonic() - started) * 1000))
+            print(message.content)
+            return 0
 
-    # --- Second model call: answer with the tool result. ---
-    started = time.monotonic()
-    try:
-        second = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=[TOOL_SCHEMA],
-        )
-    except Exception as error:
-        log.add("error", False, message=str(error),
-                duration_ms=int((time.monotonic() - started) * 1000))
-        print(f"Model request failed: {error}", file=sys.stderr)
-        return 1
+        # --- Run the tool(s) the model asked for. A failing single step ---
+        # --- must not abort the whole run: every error becomes a tool ---
+        # --- result the model can read and react to. ---
+        messages.append(message)
+        for tool_call in message.tool_calls:
+            # Broken arguments are contained like any other tool error.
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except json.JSONDecodeError:
+                args = {}
 
-    answer = second.choices[0].message.content or ""
-    log.add("final", True, duration_ms=int((time.monotonic() - started) * 1000))
-    print(answer)
-    return 0
+            name = tool_call.function.name
+            log.add("tool_call", True, step=step, tool=name, args=args)
+
+            if name == "get_calendar" and isinstance(args.get("date"), str):
+                result = get_calendar(args["date"])
+            else:
+                # Unknown tool or malformed arguments: report back to the
+                # model instead of raising.
+                result = json.dumps({"error": f"could not run tool call: {name} {args}"})
+
+            log.add("tool_result", True, step=step, tool=name,
+                    result=result if len(result) <= 500 else result[:500] + " [truncated]")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    # The step limit was reached: the run ends as an error, not a success.
+    log.add("final", False, kind="step_limit", step=MAX_STEPS,
+            message=f"step limit of {MAX_STEPS} reached; agent did not finish")
+    print(f"Step limit of {MAX_STEPS} reached; the task was not finished.",
+          file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
